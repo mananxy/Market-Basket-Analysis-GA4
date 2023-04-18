@@ -1,8 +1,9 @@
 import os
 import pandas as pd
 from google.cloud import bigquery
-from mlxtend.preprocessing import TransactionEncoder
 from mlxtend.frequent_patterns import apriori
+from mlxtend.frequent_patterns import association_rules
+from helpers import set_values_to_binary,get_dataframe,show_dtale
 
 # Set the path to the JSON credentials file
 os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = 'Auth/retail-ga4-dataset-76ffc0b63205.json'
@@ -13,7 +14,10 @@ client = bigquery.Client()
 # Set your project, dataset, and table prefix
 project_id = 'bigquery-public-data'
 dataset_id = 'ga4_obfuscated_sample_ecommerce'
-table_prefix = 'events_20210131'
+#table_prefix = 'events_20210131'
+
+# Store results of query in CSV file to avoid re-querying when writing the program.
+csv_file="query_result.csv"
 
 # Write  SQL query using the wildcard table feature
 # Write your SQL query using the wildcard table feature and date range filter
@@ -74,29 +78,40 @@ GROUP BY
 ORDER BY
   event_date
 """
-new_query = True
-if new_query:
-    query_job = client.query(sql_query)
-    result = query_job.to_dataframe()
 
-    # Save the results to a CSV file
-    result.to_csv('query_results.csv', index=False)
-else:
-    # Read the data from the saved CSV file
-    result = pd.read_csv('query_results.csv')
+result = get_dataframe(csv_file,sql_query)
+
+# Split item_categories into separate rows
+raw_split_categories = result.assign(item_categories=result["item_categories"].str.split(",")).explode("item_categories")
+
+# raw_split_categories.loc[...]: The .loc[] accessor is used to select rows from the DataFrame based on the boolean conditions within [].
+# some of the transactions had items which did not belong to any categories. Removing any such rows where there is no category and where category =New
+
+split_categories = raw_split_categories.loc[(raw_split_categories["item_categories"] != "") & (raw_split_categories["item_categories"] != "New")]
 
 
-# Prepare data for market basket analysis
-transactions = result['item_categories'].apply(lambda x: x.split(','))
 
-# Encode transactions for Apriori algorithm
-encoder = TransactionEncoder()
-encoded_transactions = encoder.fit_transform(transactions)
-transaction_df = pd.DataFrame(encoded_transactions, columns=encoder.columns_)
+# One-hot encode the item_categories
+one_hot_encoded = pd.get_dummies(split_categories, columns=["item_categories"], prefix="", prefix_sep="")
 
-# Perform market basket analysis using the Apriori algorithm
-min_support = 0.01  # Adjust this value based on your dataset and requirements
-frequent_itemsets = apriori(transaction_df, min_support=min_support, use_colnames=True)
+# Group by transaction_id and aggregate the rows
+result_encoded_grouped = one_hot_encoded.groupby(["event_date", "transaction_id", "purchased_product_skus"], as_index=False).sum()
 
-# Print the results
-print(frequent_itemsets)
+result_binary = result_encoded_grouped.copy()
+result_binary[result_binary.columns[3:]] = result_encoded_grouped.iloc[:, 3:].applymap(set_values_to_binary)
+
+
+#Generate frequent item sets that have a support of atleast 10%
+# Pass only the one-hot encoded columns to the apriori() function
+supported_itemsets = apriori(result_binary.iloc[:, 3:], min_support=0.03, use_colnames=True)
+show_dtale(supported_itemsets)
+#Generate the rules with their corresponding support, confidence and lift:
+
+rules = association_rules(supported_itemsets, metric="lift", min_threshold=1)
+show_dtale(rules)
+# Sort the rules by the 'lift' metric in descending order
+sorted_rules = rules.sort_values(by='lift', ascending=False)
+
+
+
+
